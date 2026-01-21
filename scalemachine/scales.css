@@ -171,7 +171,7 @@ body {
   border: 1px solid rgba(148, 163, 184, 0.55);
   box-shadow: var(--shadow-soft);
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1.25rem 1.5rem;
   align-items: end;
 }
@@ -237,6 +237,40 @@ body {
     right 0.4rem center;
   background-size: 6px 6px, 6px 6px;
   background-repeat: no-repeat;
+}
+
+/* Simplify toggle (■ vs ■■) */
+.simplify-toggle {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background:
+    radial-gradient(circle at top left, rgba(34, 211, 238, 0.2), transparent 55%),
+    rgba(15, 23, 42, 0.9);
+  color: var(--text-primary);
+  font-size: 1rem;
+  cursor: pointer;
+  outline: none;
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.simplify-toggle:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.2);
+}
+
+.simplify-toggle:focus-visible {
+  border-color: var(--accent-strong);
+  box-shadow:
+    0 0 0 1px rgba(34, 211, 238, 0.28),
+    0 0 0 4px rgba(34, 211, 238, 0.2);
 }
 
 /* 5. GRID SECTION & STATUS

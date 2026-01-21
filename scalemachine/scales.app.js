@@ -40,7 +40,11 @@
   const tuningOverlaySelect = $('#tuningOverlaySelect');
   const tuningOverlayStart = $('#tuningOverlayStart');
 
+  // Simplify toggle
+  const simplifyToggle = $('#simplifyToggle');
+
   const TUNING_STORAGE_KEY = 'scaleMachine_selectedTuning';
+  const SIMPLIFY_STORAGE_KEY = 'scaleMachine_simplifyAccidentals';
 
   // --- Data helpers -------------------------------------------------------
 
@@ -99,6 +103,49 @@
 
   function findHalfWholeDimKeyByName(name) {
     return HALF_WHOLE_DIM_KEYS.find((k) => k.name === name) || null;
+  }
+
+  // Normalize double accidentals to their enharmonic equivalents
+  // e.g., Bbb → A, F## → G
+  const DOUBLE_FLAT_MAP = {
+    'Abb': 'G',
+    'Bbb': 'A',
+    'Cbb': 'Bb',
+    'Dbb': 'C',
+    'Ebb': 'D',
+    'Fbb': 'Eb',
+    'Gbb': 'F',
+  };
+
+  const DOUBLE_SHARP_MAP = {
+    'A##': 'B',
+    'B##': 'C#',
+    'C##': 'D',
+    'D##': 'E',
+    'E##': 'F#',
+    'F##': 'G',
+    'G##': 'A',
+  };
+
+  function normalizeAccidental(noteName) {
+    // Check for double flats first (bb)
+    if (DOUBLE_FLAT_MAP[noteName]) {
+      return DOUBLE_FLAT_MAP[noteName];
+    }
+    // Check for double sharps (##)
+    if (DOUBLE_SHARP_MAP[noteName]) {
+      return DOUBLE_SHARP_MAP[noteName];
+    }
+    return noteName;
+  }
+
+  function normalizeScale(scaleNotes) {
+    return scaleNotes.map(normalizeAccidental);
+  }
+
+  function isSimplifyEnabled() {
+    if (!simplifyToggle) return true; // Default to simplified
+    return simplifyToggle.getAttribute('aria-pressed') === 'true';
   }
 
   // Given a one-octave scale as note names (no octaves),
@@ -406,6 +453,11 @@
         scaleNoteNames = writtenKey.scale.slice();
       }
 
+      // Apply normalization if simplify mode is enabled
+      if (isSimplifyEnabled()) {
+        scaleNoteNames = normalizeScale(scaleNoteNames);
+      }
+
       rows.push({
         concertKeyName: concertKey.name,
         writtenKeyName,
@@ -551,6 +603,32 @@
 
   // --- Wiring -------------------------------------------------------------
 
+  function updateSimplifyToggleDisplay() {
+    if (!simplifyToggle) return;
+    const isSimplified = simplifyToggle.getAttribute('aria-pressed') === 'true';
+    simplifyToggle.textContent = isSimplified ? '■' : '■■';
+  }
+
+  function initSimplifyToggle() {
+    if (!simplifyToggle) return;
+
+    // Load saved preference (default to 'true' = simplified)
+    const saved = localStorage.getItem(SIMPLIFY_STORAGE_KEY);
+    const isSimplified = saved === null ? true : saved === 'true';
+    simplifyToggle.setAttribute('aria-pressed', isSimplified ? 'true' : 'false');
+    updateSimplifyToggleDisplay();
+
+    // Toggle on click
+    simplifyToggle.addEventListener('click', () => {
+      const current = simplifyToggle.getAttribute('aria-pressed') === 'true';
+      const newValue = !current;
+      simplifyToggle.setAttribute('aria-pressed', newValue ? 'true' : 'false');
+      localStorage.setItem(SIMPLIFY_STORAGE_KEY, newValue ? 'true' : 'false');
+      updateSimplifyToggleDisplay();
+      renderGrid();
+    });
+  }
+
   function init() {
     if (!transpositionSelect || !scaleTypeSelect || !notationContainer || !gridStatus) {
       console.error('Scale Machine: missing DOM elements. Check index.html IDs.');
@@ -558,6 +636,7 @@
     }
 
     populateDropdowns();
+    initSimplifyToggle();
     initTuningOverlay();
     renderGrid();
 
@@ -582,6 +661,9 @@
     midiToFreq,
     toVexKey,
     createScaleNotes,
+    normalizeAccidental,
+    normalizeScale,
+    isSimplifyEnabled,
   };
 
   if (document.readyState === 'loading') {
