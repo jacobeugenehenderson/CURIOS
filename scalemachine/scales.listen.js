@@ -171,6 +171,39 @@
     }
   }
 
+  // The second channel: how far the player's whole center of pitch has moved
+  // from concert. A tiring embouchure shows up here as a single slowly
+  // growing number, instead of turning all sixteen note lights the same
+  // colour and drowning out the note-specific errors.
+  function updateDriftReadout(offsetCents) {
+    const el = document.getElementById('tunerDrift');
+    if (!el) return;
+
+    el.classList.remove(
+      'tuner-drift-flat',
+      'tuner-drift-sharp',
+      'tuner-drift-centered'
+    );
+
+    if (typeof offsetCents !== 'number' || !Number.isFinite(offsetCents)) {
+      el.textContent = '';
+      return;
+    }
+
+    const rounded = Math.round(offsetCents);
+    const DRIFT_DEADBAND_CENTS = 8;
+
+    if (Math.abs(rounded) < DRIFT_DEADBAND_CENTS) {
+      el.textContent = 'centred';
+      el.classList.add('tuner-drift-centered');
+      return;
+    }
+
+    el.textContent =
+      'drift: ' + Math.abs(rounded) + '¢ ' + (rounded < 0 ? 'flat' : 'sharp');
+    el.classList.add(rounded < 0 ? 'tuner-drift-flat' : 'tuner-drift-sharp');
+  }
+
   function stopRafLoop() {
     if (state.rafId != null) {
       cancelAnimationFrame(state.rafId);
@@ -480,7 +513,13 @@
     return null;
   }
   function freqToMidi(freq) {
-    return Math.round(69 + 12 * Math.log2(freq / 440));
+    return Math.round(freqToMidiExact(freq));
+  }
+
+  // Unrounded — needed wherever the fractional part *is* the signal
+  // (how far off the note you were), not noise to be discarded.
+  function freqToMidiExact(freq) {
+    return 69 + 12 * Math.log2(freq / 440);
   }
 
   function midiToPc(midi) {
@@ -519,9 +558,139 @@
   const STRICT_ZONE_CENTS = 25; // "Green" zone: musically in tune
   const LOOSE_ZONE_CENTS = 60;  // Up to ~half-step edge
 
-  // Tonic checkpoint tolerance: more generous than normal strict zone
-  // but still requires you to be "in the ballpark" of the tonic
+  // How close a tonic has to be before we trust it to re-anchor the
+  // reference drift (below). Wrong-octave / wrong-note tonics shouldn't
+  // drag the reference around.
   const TONIC_TOLERANCE_CENTS = 50;
+
+  // ── Adaptive reference drift ────────────────────────────────────────
+  // A tired or weak embouchure makes a player consistently flat (or sharp)
+  // by a roughly constant amount, and that offset drifts over a long
+  // practice session. That must never stop the cursor from following them:
+  // tracking is *relative* (do the intervals line up?), scoring is
+  // *absolute* (how in tune were you, really?).
+  const REF_DRIFT_MAX_CENTS = 150;    // never let the reference slide a whole semitone
+  const REF_DRIFT_ALPHA = 0.3;        // EMA weight per accepted note
+  const REF_DRIFT_ALPHA_TONIC = 0.55; // tonics are the strongest anchor we get
+  const MATCH_WINDOW_CENTS = 90;      // capture window per degree, after drift compensation
+  const REF_DRIFT_OUTLIER_CENTS = 50; // beyond this from centre, treat a note as a one-off
+
+  function getRefOffsetCents(ls) {
+    return ls &&
+      typeof ls.refOffsetCents === 'number' &&
+      Number.isFinite(ls.refOffsetCents)
+      ? ls.refOffsetCents
+      : 0;
+  }
+
+  function updateRefOffset(ls, rawErrCents, isTonic) {
+    if (!ls || typeof rawErrCents !== 'number' || !Number.isFinite(rawErrCents)) {
+      return;
+    }
+    // A tonic only re-anchors if it's actually near the tonic.
+    if (isTonic && Math.abs(rawErrCents - getRefOffsetCents(ls)) > TONIC_TOLERANCE_CENTS * 2) {
+      isTonic = false;
+    }
+    // Damp outliers: the drift should follow the *systematic* sag, not chase
+    // one badly-voiced note. Without this a single 100¢ clam drags the centre
+    // that every following note is judged against.
+    let alpha = isTonic ? REF_DRIFT_ALPHA_TONIC : REF_DRIFT_ALPHA;
+    if (Math.abs(rawErrCents - getRefOffsetCents(ls)) > REF_DRIFT_OUTLIER_CENTS) {
+      alpha *= 0.25;
+    }
+    const next = getRefOffsetCents(ls) * (1 - alpha) + rawErrCents * alpha;
+    ls.refOffsetCents = Math.max(
+      -REF_DRIFT_MAX_CENTS,
+      Math.min(REF_DRIFT_MAX_CENTS, next)
+    );
+  }
+
+  function noteBaseFreq(note) {
+    if (!note) return null;
+    if (typeof note.freq === 'number' && note.freq > 0) return note.freq;
+    if (typeof note.midi === 'number' && Number.isFinite(note.midi)) {
+      return midiToFreq(note.midi);
+    }
+    return null;
+  }
+
+  function centsBetween(freqA, freqB) {
+    if (!freqA || !freqB || freqA <= 0 || freqB <= 0) return null;
+    return 1200 * Math.log2(freqA / freqB);
+  }
+
+  // Smallest cents error from `freqHz` to `targetFreq` in any nearby octave.
+  // Octave-folding keeps a pitch-detector octave slip (or a player sitting an
+  // octave away from the written register) from reading as a wrong note.
+  function foldedCentsError(freqHz, targetFreq) {
+    if (!freqHz || !targetFreq) return null;
+    let best = null;
+    for (let k = -2; k <= 2; k += 1) {
+      const err = centsBetween(freqHz, targetFreq * Math.pow(2, k));
+      if (err == null) continue;
+      if (best == null || Math.abs(err) < Math.abs(best)) best = err;
+    }
+    return best;
+  }
+
+  // Where are we in the pattern? Score a small window of candidates around
+  // the cursor rather than the whole pattern: an up-and-down scale visits the
+  // same pitch two or three times, so "closest degree anywhere" is ambiguous
+  // by construction. Matching happens against drift-compensated targets, so a
+  // uniformly flat player still tracks note-for-note.
+  function matchDegree(notes, idx, freqHz, offsetCents) {
+    if (!freqHz || !notes || !notes.length) return null;
+
+    const candidates = [
+      { i: idx, bias: 0 },        // the note that's due
+      { i: idx + 1, bias: 40 },   // we missed an onset — catch up
+      { i: idx - 1, bias: 55 },   // re-articulation of the note just played
+      { i: idx + 2, bias: 110 },  // missed two — only on a clean hit
+    ];
+
+    const drift = Math.pow(2, (offsetCents || 0) / 1200);
+    let best = null;
+
+    for (let c = 0; c < candidates.length; c += 1) {
+      const i = candidates[c].i;
+      if (i < 0 || i >= notes.length) continue;
+
+      const n = notes[i];
+      const base = noteBaseFreq(n);
+      if (!base) continue;
+
+      const relErr = foldedCentsError(freqHz, base * drift);
+      if (relErr == null) continue;
+
+      // Stay inside this degree's territory, capped by the match window so a
+      // wide interval can't swallow its neighbour.
+      const left =
+        n.territory && typeof n.territory.leftCents === 'number'
+          ? Math.max(n.territory.leftCents, -MATCH_WINDOW_CENTS)
+          : -MATCH_WINDOW_CENTS;
+      const right =
+        n.territory && typeof n.territory.rightCents === 'number'
+          ? Math.min(n.territory.rightCents, MATCH_WINDOW_CENTS)
+          : MATCH_WINDOW_CENTS;
+
+      if (relErr < left || relErr > right) continue;
+
+      const score = Math.abs(relErr) + candidates[c].bias;
+      if (!best || score < best.score) {
+        best = { index: i, relErrCents: relErr, score: score };
+      }
+    }
+
+    return best;
+  }
+
+  // Emoji for a note we've already confirmed is the *right* note.
+  // 🟥 is reserved for "wrong note"; a matched note is only ever green,
+  // blue (sharp) or yellow (flat), however far off it is.
+  function classifyMatchedError(errCents) {
+    if (Math.abs(errCents) <= STRICT_ZONE_CENTS) return '🟩';
+    return errCents > 0 ? '🟦' : '🟨';
+  }
 
   function classifyErrorToEmoji(errCents) {
     const abs = Math.abs(errCents);
@@ -536,6 +705,57 @@
 
   // Expose for console testing (IIFE keeps everything private otherwise)
   window.classifyErrorToEmoji = classifyErrorToEmoji;
+
+  // Staff colours for the follow cursor. While you're playing you read the
+  // staff peripherally, so the note that's *due* has to be unmistakable at a
+  // glance — that's the visual half of the muscle-memory loop. Notes already
+  // played stay bright enough to read back as a record of the run; notes
+  // still coming are dimmed but legible, so you can see what's ahead.
+  const CURSOR_COLOR = '#22d3ee';   // --accent, cyan-400
+  const PLAYED_COLOR = '#e5e7eb';   // --text-primary
+  const UPCOMING_COLOR = '#64748b'; // dimmed, still readable
+  const CURSOR_BAND_FILL = 'rgba(34, 211, 238, 0.14)';
+
+  // Draws the "you are here" band + caret behind the note that's due.
+  // Called after formatting (positions aren't known before) and before the
+  // voice is drawn, so noteheads sit on top of the band.
+  function drawFollowCursor(context, stave, vfNote) {
+    if (!context || !stave || !vfNote) return;
+    // Centre on the notehead, not on getAbsoluteX() — that's where the note's
+    // tick starts, which sits a glyph-width to the left of the head and leaves
+    // the band pointing at the gap before the note.
+    let cx = null;
+    if (
+      typeof vfNote.getNoteHeadBeginX === 'function' &&
+      typeof vfNote.getNoteHeadEndX === 'function'
+    ) {
+      cx = (vfNote.getNoteHeadBeginX() + vfNote.getNoteHeadEndX()) / 2;
+    } else if (typeof vfNote.getAbsoluteX === 'function') {
+      cx = vfNote.getAbsoluteX();
+    }
+
+    if (typeof cx !== 'number' || !Number.isFinite(cx)) return;
+
+    const top = stave.getYForLine(-1.5);
+    const bottom = stave.getYForLine(5.5);
+    const bandWidth = 24;
+
+    context.save();
+
+    context.setFillStyle(CURSOR_BAND_FILL);
+    context.fillRect(cx - bandWidth / 2, top, bandWidth, bottom - top);
+
+    // Caret below the staff: an unambiguous "play this one".
+    context.setFillStyle(CURSOR_COLOR);
+    context.beginPath();
+    context.moveTo(cx - 5, bottom + 11);
+    context.lineTo(cx + 5, bottom + 11);
+    context.lineTo(cx, bottom + 4);
+    context.closePath();
+    context.fill();
+
+    context.restore();
+  }
 
   // Render an empty staff (hardware only) in the Magic Box when we first start listening.
   function renderEmptyActiveStaff(clef) {
@@ -849,6 +1069,25 @@
     // knows how far each note "owns" before it becomes its neighbor.
     buildTerritoriesFromExpected(ls.expectedNotes);
 
+    // Colour each note by where it sits relative to the cursor.
+    const cursorIdx =
+      typeof ls.currentIndex === 'number' &&
+      ls.currentIndex >= 0 &&
+      ls.currentIndex < notes.length
+        ? ls.currentIndex
+        : 0;
+
+    notes.forEach(function (vfNote, idx) {
+      if (!vfNote || typeof vfNote.setStyle !== 'function') return;
+
+      const color =
+        idx === cursorIdx
+          ? CURSOR_COLOR
+          : (idx < cursorIdx ? PLAYED_COLOR : UPCOMING_COLOR);
+
+      vfNote.setStyle({ fillStyle: color, strokeStyle: color });
+    });
+
     const voice = new VF.Voice({
       num_beats: notes.length,
       beat_value: 4,
@@ -857,8 +1096,25 @@
 
     voice.addTickables(notes);
 
+    // Bind the stave to each note before formatting. Voice.setStave() only
+    // tags the voice — the notes don't get theirs until Voice.draw(), and
+    // until a note has a stave getAbsoluteX() omits the clef + key-signature
+    // width, landing the cursor band a slot left of the note it marks.
+    voice.setStave(stave);
+    notes.forEach(function (vfNote) {
+      if (vfNote && typeof vfNote.setStave === 'function') vfNote.setStave(stave);
+    });
+
     const layoutWidth = staveWidth - 60;
     new VF.Formatter().joinVoices([voice]).format([voice], layoutWidth);
+
+    // Cursor first, so the notehead sits on top of the band rather than under it.
+    try {
+      drawFollowCursor(context, stave, notes[cursorIdx]);
+    } catch (e) {
+      console.warn('[Listen] Could not draw follow cursor:', e);
+    }
+
     voice.draw(context, stave);
 
     // Keep a simple reference for future tweaks.
@@ -994,7 +1250,6 @@ function handleNoteEvent(pitchFrame) {
         : null;
   }
 
-  const playedIdx = frame.degreeIndex;
 
   // Debug mode: any onset advances one step with a green emoji.
   if (DEBUG_ACCEPT_ANY_NOTE) {
@@ -1045,158 +1300,95 @@ function handleNoteEvent(pitchFrame) {
     return;
   }
 
-  // If we couldn't map this onset to any degree at all, treat as hard wrong.
-  if (
-    playedIdx === null ||
-    playedIdx < 0 ||
-    playedIdx >= notes.length
-  ) {
+  // ── Track relatively, score absolutely ──────────────────────────────
+  // Which degree did they actually play? Matched against drift-compensated
+  // targets in a window around the cursor, so a uniformly flat player still
+  // tracks note-for-note.
+  const offsetCents = getRefOffsetCents(ls);
+  const match = matchDegree(notes, idx, frame.freqHz, offsetCents);
+
+  if (!match) {
+    // Nothing near the cursor in any direction — a genuinely wrong note.
+    // 🟥 means wrong note, and only that.
     expected.feedback = '🟥';
     expected.detectedFreqHz = frame.freqHz;
-    expected.pitchErrorCents = 0;
-
-    notes.forEach(function (n, j) {
-      if (j !== idx && n) {
-        n.feedback = null;
-      }
-    });
+    expected.pitchErrorCents = null;
 
     try {
       if (ls.noteSequence && ls.noteSequence.length) {
         renderActiveScaleStaff(ls.noteSequence, ls.clef || 'treble');
       }
     } catch (e) {
-      console.error(
-        '[Listen] Error re-rendering active scale staff after unmapped degree',
-        e
-      );
+      console.error('[Listen] Error re-rendering staff after wrong note', e);
     }
 
     console.log(
-      '[Listen] Unmapped degree; marking idx =',
-      idx,
-      'as 🟥 (no advancement)'
+      '[Listen] idx =', idx,
+      'no degree match near cursor; freq =',
+      frame.freqHz ? frame.freqHz.toFixed(1) + 'Hz' : '(n/a)',
+      ', drift =', offsetCents.toFixed(0) + '¢, 🟥 (no advancement)'
     );
     return;
   }
 
-  // Calculate error relative to the EXPECTED note (not the closest matched degree)
-  // This is what matters for feedback: how close were you to what you SHOULD play?
-  let errCentsFromExpected = 0;
-  if (frame.freqHz && expected.freq && expected.freq > 0) {
-    errCentsFromExpected = 1200 * Math.log2(frame.freqHz / expected.freq);
-  } else if (frame.freqHz && typeof expected.midi === 'number') {
-    const expectedFreq = midiToFreq(expected.midi);
-    if (expectedFreq > 0) {
-      errCentsFromExpected = 1200 * Math.log2(frame.freqHz / expectedFreq);
-    }
+  const matched = notes[match.index];
+  const isTonic = matched.isTonic === true;
+
+  // Absolute error: how far from concert pitch. This is the embouchure
+  // story, and it belongs in the tuner strip — reported once, not restated
+  // on all sixteen notes.
+  const absErrCents = foldedCentsError(frame.freqHz, noteBaseFreq(matched));
+
+  // Relative error: how far from *your own* current center. This is what
+  // the lights show, so they surface the notes that are off even by your
+  // standards today rather than echoing the global sag.
+  const relErrCents = match.relErrCents;
+
+  // Fold this note into the running drift estimate *after* scoring it,
+  // so a note is never graded against a center it just moved.
+  if (absErrCents != null) {
+    updateRefOffset(ls, absErrCents, isTonic);
   }
 
-  // Territory-based classification relative to the EXPECTED degree.
-  let baseEmoji = '🟥';
-  let inTerritory = false;
+  const emoji = classifyMatchedError(relErrCents);
 
-  const territory = expected.territory ? expected.territory : null;
-  if (
-    territory &&
-    typeof territory.leftCents === 'number' &&
-    typeof territory.rightCents === 'number'
-  ) {
-    const left = territory.leftCents;
-    const right = territory.rightCents;
-    const isSharp = errCentsFromExpected > 0;
-
-    if (errCentsFromExpected < left || errCentsFromExpected > right) {
-      // Outside this degree's territory → wrong note.
-      baseEmoji = '🟥';
-      inTerritory = false;
-    } else {
-      // Inside this degree's territory → non-red (green/blue/yellow).
-      inTerritory = true;
-
-      const span = Math.max(Math.abs(left), Math.abs(right)) || 1;
-      const norm = Math.abs(errCentsFromExpected) / span;
-      const GREEN_FRACTION = 0.7;
-
-      if (norm <= GREEN_FRACTION) {
-        baseEmoji = '🟩';
-      } else {
-        baseEmoji = isSharp ? '🟦' : '🟨';
-      }
-    }
-  } else {
-    // Fallback if we ever lose territory data.
-    baseEmoji = classifyErrorToEmoji(errCentsFromExpected);
-    inTerritory = baseEmoji !== '🟥';
-  }
-
-  // Degree match: we mostly expect playedIdx === idx, but in practice
-  // the tuner can land off-by-one. We'll allow ±1 degree slack, but
-  // still only ever step *forward* through LISTEN_PATTERN.
-  const degreeOffset =
-    typeof playedIdx === 'number' ? (playedIdx - idx) : 0;
-
-  const degreeMatches =
-    degreeOffset === 0 ||
-    Math.abs(degreeOffset) === 1;
-
-  // TONIC CHECKPOINT LOGIC:
-  // - Tonic notes (start, turnaround, end) require pitch accuracy
-  // - Non-tonic notes advance on any onset (gate-based progression)
-  const isTonic = expected.isTonic === true;
-  let isGoodForStep;
-
-  if (isTonic) {
-    // Tonic checkpoint: must be within TONIC_TOLERANCE_CENTS of the expected pitch
-    const tonicOk = Math.abs(errCentsFromExpected) <= TONIC_TOLERANCE_CENTS;
-    isGoodForStep = tonicOk;
-  } else {
-    // Non-tonic: any detected onset advances (gate-based)
-    // We still show the feedback emoji, but don't block progression
-    isGoodForStep = true;
-  }
-
-  // Final emoji we show on the *current* degree:
-  // For tonic checkpoints: show 🟥 if pitch was too far off (blocked)
-  // For non-tonic: always show the actual accuracy feedback (but still advance)
-  const finalEmoji = isTonic
-    ? (isGoodForStep ? baseEmoji : '🟥')
-    : baseEmoji;
-
-  // Keep the tuner strip in sync with accepted note events as well.
+  // Keep the tuner strip in sync: needle + label stay absolute, and the
+  // drift readout carries the overall embouchure offset.
   if (frame.freqHz && typeof freqToMidi === 'function' && typeof midiToNoteName === 'function') {
     const midiForTuner = freqToMidi(frame.freqHz);
-    const noteLabelForTuner = midiToNoteName(midiForTuner);
     updateTuner(
-      noteLabelForTuner + ' · ' + frame.freqHz.toFixed(1) + ' Hz',
-      errCentsFromExpected
+      midiToNoteName(midiForTuner) + ' · ' + frame.freqHz.toFixed(1) + ' Hz',
+      absErrCents
     );
   }
+  updateDriftReadout(getRefOffsetCents(ls));
 
-  expected.feedback = finalEmoji;
-  expected.detectedFreqHz = frame.freqHz;
-  expected.pitchErrorCents = errCentsFromExpected;
+  // A re-articulation of a note we already graded shouldn't repaint it: the
+  // first attempt is the honest record, and the cursor sitting still is what
+  // says we're still owed the note that's due.
+  if (!(match.index < idx && matched.feedback)) {
+    matched.feedback = emoji;
+  }
+  matched.detectedFreqHz = frame.freqHz;
+  matched.pitchErrorCents = absErrCents;
+  matched.relErrorCents = relErrCents;
 
-  // Clear feedback on all other degrees.
-  notes.forEach(function (n, j) {
-    if (j !== idx && n) {
-      n.feedback = null;
-    }
-  });
+  // The lights persist for the whole run — the shape of the pass is the
+  // useful artifact, not a single blinking square.
 
-  // State machine advancement
-  if (isGoodForStep) {
-    ls.progressState = 'running';
+  // Advance. Intonation never blocks: if you played the right note, the
+  // cursor moves, however flat you were.
+  ls.progressState = 'running';
 
-    if (ls.currentIndex < notes.length - 1) {
-      ls.currentIndex += 1;
-    } else {
-      // Finished the pattern — advance to next chromatic scale
+  if (match.index >= idx) {
+    if (match.index >= notes.length - 1) {
       console.log('[Listen] Completed scale, advancing to next...');
       advanceToNextScale();
       return;
     }
+    ls.currentIndex = match.index + 1;
   }
+  // match.index < idx → a re-articulation of the previous note; hold the cursor.
 
   // Re-render current staff with updated emoji lane.
   try {
@@ -1211,24 +1403,17 @@ function handleNoteEvent(pitchFrame) {
   }
 
   console.log(
-    '[Listen] idx =',
-    idx,
-    'playedIdx =',
-    playedIdx,
+    '[Listen] idx =', idx,
+    '→ matched', match.index, '(' + (matched.name || '?') + ')',
     ', freq =',
     frame.freqHz && typeof frame.freqHz === 'number'
       ? frame.freqHz.toFixed(1) + 'Hz'
       : '(n/a)',
-    'err =',
-    errCentsFromExpected.toFixed(1),
-    'cents, baseEmoji =',
-    baseEmoji,
-    ', finalEmoji =',
-    finalEmoji,
-    ', isTonic =',
-    isTonic,
-    ', advance =',
-    isGoodForStep
+    ', abs =', absErrCents != null ? absErrCents.toFixed(1) + '¢' : '(n/a)',
+    ', rel =', relErrCents.toFixed(1) + '¢',
+    ', drift =', getRefOffsetCents(ls).toFixed(1) + '¢',
+    ', light =', emoji,
+    ', isTonic =', isTonic
   );
 }
 
@@ -1404,6 +1589,10 @@ function handleNoteEvent(pitchFrame) {
     ls.currentIndex = 0;
     ls.progressState = 'idle';
     ls.noteSequence = upDownWithOctaves;
+    ls.lastOnsetMidi = null;
+    ls.lastStableMidi = null;
+    // refOffsetCents deliberately survives: it's the same embouchure on the
+    // next key, and it only sags further as the session goes on.
 
     // Clear feedback
     if (ls.expectedNotes) {
@@ -1437,9 +1626,16 @@ function handleNoteEvent(pitchFrame) {
   }
 
   function lockTonic(freq, tuningDesc) {
-    const midi = freqToMidi(freq);
+    const exactMidi = freqToMidiExact(freq);
+    const midi = Math.round(exactMidi);
     const pc = midiToPc(midi);
     const octave = Math.floor(midi / 12) - 1;
+
+    // How far off was the held tonic? This seeds the reference drift below.
+    const tonicDriftCents = Math.max(
+      -REF_DRIFT_MAX_CENTS,
+      Math.min(REF_DRIFT_MAX_CENTS, (exactMidi - midi) * 100)
+    );
 
     const txSelect = $('transpositionSelect');
     const scaleTypeSelect = $('scaleTypeSelect');
@@ -1564,9 +1760,18 @@ function handleNoteEvent(pitchFrame) {
       lastDegreeIndex: null,
       degreeStreak: 0,
       lastOnsetDegreeIndex: null,
+      lastOnsetMidi: null,
+      lastStableMidi: null,
       prevRms: 0,
       lastOnsetTimeMs: 0,
       lastActiveTimeMs: 0,
+
+      // The tonic capture is the one absolute demand we make: hit it and
+      // hold it briefly. Everything after is relative, so we seed the drift
+      // with however far off that held tonic actually was — the first note
+      // of the run is already scored in the player's own frame instead of
+      // waiting two or three notes for the estimate to converge.
+      refOffsetCents: tonicDriftCents,
       tuner: {
         degreeIndex: null,
         centsOffset: 0,
@@ -1818,16 +2023,25 @@ function handleNoteEvent(pitchFrame) {
         updateTuner('', null);
       }
 
-      // Stability / confidence (how long we've been on this degree)
-      const prevDegree = ls.lastDegreeIndex;
-      const MIN_DEGREE_STABLE_FRAMES = 2;
+      // Onsets are keyed to the *semitone the player is sitting on*, measured
+      // in their own drift-compensated frame — not to a degree index. The
+      // pattern visits the same pitch two or three times, so degree indices
+      // are ambiguous by construction; a semitone identity isn't.
+      const driftCents = getRefOffsetCents(ls);
+      const stableMidi = Math.round(
+        freqToMidiExact(smoothedFreq) - driftCents / 100
+      );
 
-      if (closestIdx != null && closestIdx === prevDegree) {
+      // Stability / confidence (how long we've held this semitone)
+      const MIN_DEGREE_STABLE_FRAMES = 3;
+
+      if (Number.isFinite(stableMidi) && stableMidi === ls.lastStableMidi) {
         ls.degreeStreak = (ls.degreeStreak || 0) + 1;
       } else {
-        ls.lastDegreeIndex = closestIdx;
-        ls.degreeStreak = closestIdx != null ? 1 : 0;
+        ls.lastStableMidi = Number.isFinite(stableMidi) ? stableMidi : null;
+        ls.degreeStreak = Number.isFinite(stableMidi) ? 1 : 0;
       }
+      ls.lastDegreeIndex = closestIdx;
 
       ls.tuner.confidence =
         ls.degreeStreak > 0
@@ -1849,12 +2063,17 @@ function handleNoteEvent(pitchFrame) {
           ? ls.lastActiveTimeMs
           : (typeof ls.lastOnsetTimeMs === 'number' ? ls.lastOnsetTimeMs : 0);
 
+      // We're loud and pitched right now, so this counts as activity.
+      ls.lastActiveTimeMs = nowMs;
+
       if (
         ls &&
         lastActivity > 0 &&
         nowMs - lastActivity > RESET_TIMEOUT_MS
       ) {
         ls.lastOnsetTimeMs = 0;
+        ls.lastOnsetMidi = null;
+        ls.lastStableMidi = null;
         ls.currentIndex = 0;
         ls.progressState = 'idle';
 
@@ -1917,21 +2136,23 @@ function handleNoteEvent(pitchFrame) {
 
       // A. Loudness-based onset (tongued notes): quiet→loud or strong attack.
       const loudOnset =
-        closestIdx != null &&
+        Number.isFinite(stableMidi) &&
         ((!wasLoud && isLoud) || strongAttack);
 
-      // B. Pitch-change onset (slurred notes): loud→loud + stable new degree.
+      // B. Pitch-change onset (slurred notes): loud→loud + a stable move to a
+      //    new semitone.
       const pitchOnset =
         wasLoud &&
         isLoud &&
-        closestIdx != null &&
-        closestIdx !== ls.lastOnsetDegreeIndex &&
+        Number.isFinite(stableMidi) &&
+        stableMidi !== ls.lastOnsetMidi &&
         ls.degreeStreak >= MIN_DEGREE_STABLE_FRAMES;
 
       const isOnset = loudOnset || pitchOnset;
 
       if (isOnset) {
         ls.lastOnsetDegreeIndex = closestIdx;
+        ls.lastOnsetMidi = stableMidi;
         ls.lastOnsetTimeMs = nowMs;
 
         try {

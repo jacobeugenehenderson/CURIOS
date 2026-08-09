@@ -716,6 +716,30 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Overall embouchure offset — the absolute story, reported once here so the
+   per-note lights are free to show deviation from the player's own center. */
+.tuner-drift {
+  font-size: 0.65rem;
+  text-align: center;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  opacity: 0.85;
+  min-height: 0.9rem;
+}
+
+.tuner-drift.tuner-drift-flat {
+  color: #facc15;
+}
+
+.tuner-drift.tuner-drift-sharp {
+  color: #60a5fa;
+}
+
+.tuner-drift.tuner-drift-centered {
+  color: #4ade80;
+}
+
 .listen-reset-button {
   font-size: 0.75rem;
   padding: 0.15rem 0.6rem;
